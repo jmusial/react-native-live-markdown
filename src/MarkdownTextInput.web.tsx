@@ -21,17 +21,17 @@ import {getCurrentCursorPosition, removeSelection, setCursorPosition} from './we
 import './web/MarkdownTextInput.css';
 import type {MarkdownStyle} from './MarkdownTextInputDecoratorViewNativeComponent';
 import {getElementHeight, getPlaceholderValue, isEventComposing, normalizeValue, parseInnerHTMLToText} from './web/utils/inputUtils';
-import {parseToReactDOMStyle, processMarkdownStyle} from './web/utils/webStyleUtils';
+import {idGenerator, parseToReactDOMStyle, processMarkdownStyle} from './web/utils/webStyleUtils';
 import {forceRefreshAllImages} from './web/inputElements/inlineImage';
-import type {InlineImagesInputProps} from './commonTypes';
+import type {MarkdownRange, InlineImagesInputProps} from './commonTypes';
 import {deepEqualMarkdownStyles} from './styleUtils';
-
-require('../parser/react-native-live-markdown-parser.js');
 
 const useClientEffect = typeof window === 'undefined' ? useEffect : useLayoutEffect;
 
 interface MarkdownTextInputProps extends TextInputProps, InlineImagesInputProps {
   markdownStyle?: MarkdownStyle;
+  parser: (text: string) => MarkdownRange[];
+  formatSelection?: (text: string, selectionStart: number, selectionEnd: number, formatCommand: string) => FormatSelectionResult;
   onClick?: (e: MouseEvent<HTMLDivElement>) => void;
   dir?: string;
   disabled?: boolean;
@@ -39,6 +39,8 @@ interface MarkdownTextInputProps extends TextInputProps, InlineImagesInputProps 
 
 interface MarkdownNativeEvent extends Event {
   inputType?: string;
+  isComposing?: boolean;
+  keyCode?: number;
 }
 
 type MarkdownTextInput = TextInput & React.Component<MarkdownTextInputProps>;
@@ -53,6 +55,11 @@ type Dimensions = {
   height: number;
 };
 
+type FormatSelectionResult = {
+  updatedText: string;
+  cursorOffset: number;
+};
+
 type ParseTextResult = {
   text: string;
   cursorPosition: number | null;
@@ -63,6 +70,7 @@ let focusTimeout: NodeJS.Timeout | null = null;
 type MarkdownTextInputElement = HTMLDivElement &
   HTMLInputElement & {
     tree: TreeNode;
+    uniqueId: string;
     selection: Selection;
     imageElements: HTMLImageElement[];
   };
@@ -80,12 +88,15 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
       autoCapitalize = 'sentences',
       autoCorrect = true,
       blurOnSubmit = false,
+      caretHidden,
       clearTextOnFocus,
       dir = 'auto',
       disabled = false,
       numberOfLines,
       multiline = false,
       markdownStyle,
+      parser,
+      formatSelection,
       onBlur,
       onChange,
       onChangeText,
@@ -112,12 +123,18 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
     },
     ref,
   ) => {
-    const compositionRef = useRef<boolean>(false);
+    if (parser === undefined) {
+      throw new Error('[react-native-live-markdown] `parser` is undefined');
+    }
+    if (typeof parser !== 'function') {
+      throw new Error('[react-native-live-markdown] `parser` is not a function');
+    }
+
     const divRef = useRef<MarkdownTextInputElement | null>(null);
     const currentlyFocusedField = useRef<HTMLDivElement | null>(null);
     const contentSelection = useRef<Selection | null>(null);
     const className = `react-native-live-markdown-input-${multiline ? 'multiline' : 'singleline'}`;
-    const history = useRef<InputHistory>();
+    const history = useRef<InputHistory | null>(null);
     const dimensions = useRef<Dimensions | null>(null);
     const pasteContent = useRef<string | null>(null);
     const hasJustBeenFocused = useRef<boolean>(false);
@@ -127,7 +144,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
     }
 
     const flattenedStyle = useMemo(() => StyleSheet.flatten(style), [style]);
-    const prevMarkdownStyle = useRef<MarkdownStyle>();
+    const prevMarkdownStyle = useRef<MarkdownStyle>(null);
     const memoizedMarkdownStyle = useMemo(() => {
       if (prevMarkdownStyle.current && deepEqualMarkdownStyles(prevMarkdownStyle.current, markdownStyle ?? {})) {
         return prevMarkdownStyle.current;
@@ -136,7 +153,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
     }, [markdownStyle]);
 
     useEffect(() => {
-      prevMarkdownStyle.current = memoizedMarkdownStyle;
+      prevMarkdownStyle.current = memoizedMarkdownStyle || null;
     }, [memoizedMarkdownStyle]);
 
     // Empty placeholder would collapse the div, so we need to use zero-width space to prevent it
@@ -158,6 +175,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
 
     const parseText = useCallback(
       (
+        parserFunction: (input: string) => MarkdownRange[],
         target: MarkdownTextInputElement,
         text: string | null,
         customMarkdownStyles: MarkdownStyle,
@@ -175,6 +193,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
           return {text: divRef.current.value, cursorPosition: null};
         }
         const parsedText = updateInputStructure(
+          parserFunction,
           target,
           text,
           cursorPosition,
@@ -203,10 +222,10 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
     const processedMarkdownStyle = useMemo(() => {
       const newMarkdownStyle = processMarkdownStyle(memoizedMarkdownStyle);
       if (divRef.current) {
-        parseText(divRef.current, divRef.current.value, newMarkdownStyle, null, false, false, false, true);
+        parseText(parser, divRef.current, divRef.current.value, newMarkdownStyle, null, false, false, false, true);
       }
       return newMarkdownStyle;
-    }, [memoizedMarkdownStyle, parseText]);
+    }, [parser, memoizedMarkdownStyle, parseText]);
 
     const inputStyles = useMemo(
       () =>
@@ -218,8 +237,9 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
           {whiteSpace: multiline ? 'pre-wrap' : 'nowrap'},
           disabled && styles.disabledInputStyles,
           parseToReactDOMStyle(flattenedStyle),
+          caretHidden && styles.caretHidden,
         ]) as CSSProperties,
-      [flattenedStyle, multiline, disabled],
+      [flattenedStyle, multiline, disabled, caretHidden],
     );
 
     const undo = useCallback(
@@ -232,9 +252,9 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
         }
         const item = history.current.undo();
         const undoValue = item ? item.text : null;
-        return parseText(target, undoValue, processedMarkdownStyle, item ? item.cursorPosition : null, false);
+        return parseText(parser, target, undoValue, processedMarkdownStyle, item ? item.cursorPosition : null, false);
       },
-      [parseText, processedMarkdownStyle],
+      [parser, parseText, processedMarkdownStyle],
     );
 
     const redo = useCallback(
@@ -247,9 +267,25 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
         }
         const item = history.current.redo();
         const redoValue = item ? item.text : null;
-        return parseText(target, redoValue, processedMarkdownStyle, item ? item.cursorPosition : null, false);
+        return parseText(parser, target, redoValue, processedMarkdownStyle, item ? item.cursorPosition : null, false);
       },
-      [parseText, processedMarkdownStyle],
+      [parser, parseText, processedMarkdownStyle],
+    );
+
+    const handleFormatSelection = useCallback(
+      (target: MarkdownTextInputElement, parsedText: string, cursorPosition: number, formatCommand: string): ParseTextResult => {
+        if (!contentSelection.current || contentSelection.current.end - contentSelection.current.start < 1) {
+          throw new Error('[react-native-live-markdown] Trying to apply format command on empty selection');
+        }
+
+        if (!formatSelection) {
+          return parseText(parser, target, parsedText, processedMarkdownStyle, cursorPosition);
+        }
+
+        const {updatedText, cursorOffset} = formatSelection(parsedText, contentSelection.current.start, contentSelection.current.end, formatCommand);
+        return parseText(parser, target, updatedText, processedMarkdownStyle, cursorPosition + cursorOffset, true);
+      },
+      [parser, parseText, formatSelection, processedMarkdownStyle],
     );
 
     // Placeholder text color logic
@@ -336,6 +372,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
         }
         const nativeEvent = e.nativeEvent as MarkdownNativeEvent;
         const inputType = nativeEvent.inputType;
+        const isComposing = isEventComposing(nativeEvent);
 
         updateTextColor(divRef.current, e.target.textContent ?? '');
         const previousText = divRef.current.value;
@@ -357,7 +394,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
             ? Math.max(contentSelection.current.start, 0) // Don't move the caret when deleting forward with no characters selected
             : Math.max(Math.max(contentSelection.current.end, 0) + (parsedText.length - previousText.length), 0);
 
-        if (compositionRef.current) {
+        if (isComposing) {
           updateTextColor(divRef.current, parsedText);
           updateSelection(e, {
             start: newCursorPosition,
@@ -377,8 +414,13 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
           case 'historyRedo':
             newInputUpdate = redo(divRef.current);
             break;
+          case 'formatBold':
+          case 'formatItalic':
+          case 'formatUnderline':
+            newInputUpdate = handleFormatSelection(divRef.current, parsedText, newCursorPosition, inputType);
+            break;
           default:
-            newInputUpdate = parseText(divRef.current, parsedText, processedMarkdownStyle, newCursorPosition, true, !inputType, inputType === 'pasteText');
+            newInputUpdate = parseText(parser, divRef.current, parsedText, processedMarkdownStyle, newCursorPosition, true, !inputType, inputType === 'pasteText');
         }
         const {text, cursorPosition} = newInputUpdate;
         updateTextColor(divRef.current, text);
@@ -430,7 +472,21 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
 
         handleContentSizeChange();
       },
-      [updateTextColor, updateSelection, onChange, onChangeText, handleContentSizeChange, undo, redo, parseText, processedMarkdownStyle, setEventProps, maxLength],
+      [
+        parser,
+        updateTextColor,
+        updateSelection,
+        onChange,
+        onChangeText,
+        handleContentSizeChange,
+        undo,
+        redo,
+        handleFormatSelection,
+        parseText,
+        processedMarkdownStyle,
+        setEventProps,
+        maxLength,
+      ],
     );
 
     const insertText = useCallback(
@@ -625,13 +681,8 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
       [insertText],
     );
 
-    const startComposition = useCallback(() => {
-      compositionRef.current = true;
-    }, []);
-
     const endComposition = useCallback(
       (e: React.CompositionEvent<HTMLDivElement>) => {
-        compositionRef.current = false;
         handleOnChangeText(e);
       },
       [handleOnChangeText],
@@ -678,17 +729,17 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
         }
 
         if (value === undefined) {
-          parseText(divRef.current, divRef.current.value, processedMarkdownStyle);
+          parseText(parser, divRef.current, divRef.current.value, processedMarkdownStyle);
           return;
         }
         const normalizedValue = normalizeValue(value);
 
         divRef.current.value = normalizedValue;
-        parseText(divRef.current, normalizedValue, processedMarkdownStyle, null, true, false, true);
+        parseText(parser, divRef.current, normalizedValue, processedMarkdownStyle, null, true, false, true);
 
         updateTextColor(divRef.current, value);
       },
-      [multiline, processedMarkdownStyle, value, maxLength],
+      [parser, multiline, processedMarkdownStyle, value, maxLength],
     );
 
     useClientEffect(
@@ -711,6 +762,7 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
       if (autoFocus) {
         divRef.current.focus();
       }
+      divRef.current.uniqueId = idGenerator.next().value as string;
       // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
@@ -756,7 +808,6 @@ const MarkdownTextInput = React.forwardRef<MarkdownTextInput, MarkdownTextInputP
         autoCapitalize={autoCapitalize}
         className={className}
         onKeyDown={handleKeyPress}
-        onCompositionStart={startComposition}
         onCompositionEnd={endComposition}
         onInput={handleOnChangeText}
         onClick={handleClick}
@@ -783,8 +834,8 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     borderStyle: 'solid',
     fontFamily: 'sans-serif',
-    // @ts-expect-error it works on web
     boxSizing: 'border-box',
+    // @ts-expect-error it works on web
     overflowY: 'auto',
     overflowX: 'auto',
     overflowWrap: 'break-word',
@@ -793,8 +844,18 @@ const styles = StyleSheet.create({
     opacity: 0.75,
     cursor: 'auto',
   },
+  caretHidden: {
+    // @ts-expect-error it works on web
+    caretColor: 'transparent',
+  },
 });
 
 export default MarkdownTextInput;
 
-export type {MarkdownTextInputProps, MarkdownTextInputElement, HTMLMarkdownElement};
+export type {MarkdownNativeEvent, MarkdownTextInputProps, MarkdownTextInputElement, HTMLMarkdownElement};
+
+function getWorkletRuntime() {
+  throw new Error('[react-native-live-markdown] `getWorkletRuntime` is not available on web. Please make sure to use it only on native Android or iOS.');
+}
+
+export {getWorkletRuntime};

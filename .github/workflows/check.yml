@@ -17,31 +17,20 @@ jobs:
       cancel-in-progress: true
     steps:
       - name: Check out Git repository
-        uses: actions/checkout@v4
+        # v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
 
       - name: Use Node.js 18
-        uses: actions/setup-node@v4
+        # v4
+        uses: actions/setup-node@cdca7365b2dadb8aad0a33bc7601856ffabcc48e
         with:
           node-version: 18
 
       - name: Install node_modules
         run: npm ci
 
-      - name: Verify there's no parser diff
-        working-directory: parser
-        run: |
-          npm run build
-          if ! git diff --name-only --exit-code; then
-            # shellcheck disable=SC2016
-            echo 'Error: Parser diff detected! Please run `cd parser && npm run build` and commit the changes.'
-            exit 1
-          fi
-
       - name: Typecheck library
         run: npm run typecheck -- --project tsconfig.json
-
-      - name: Typecheck parser
-        run: npm run typecheck -- --project parser/tsconfig.json
 
       - name: Typecheck example app
         run: npm run typecheck -- --project example/tsconfig.json
